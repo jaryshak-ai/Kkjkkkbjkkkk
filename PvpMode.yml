@@ -1,0 +1,931 @@
+name: Build PvpMode
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create project files
+        run: |
+          mkdir -p PvpMode/src/main/java/pvpmode PvpMode/src/main/resources
+
+          cat > PvpMode/pom.xml <<'__POM_EOF__'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>pvpmode</groupId>
+            <artifactId>PvpMode</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <repositories>
+              <repository>
+                <id>repo-lanink-cn</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+              </repository>
+            </repositories>
+            <dependencies>
+              <dependency>
+                <groupId>com.nukkit-mot</groupId>
+                <artifactId>nukkit-mot</artifactId>
+                <version>1.26.30-R1</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+            <build>
+              <finalName>PvpMode</finalName>
+            </build>
+          </project>
+          __POM_EOF__
+
+          cat > PvpMode/src/main/resources/plugin.yml <<'__PLUGIN_EOF__'
+          name: PvpMode
+          main: pvpmode.PvpMode
+          version: 1.0.0
+          api: ["1.0.0"]
+          load: POSTWORLD
+          author: server
+          description: PvP режим после урона от игрока
+          softdepend: [AntiCheat, LuckPerms]
+          permissions:
+            pvpmode.bypass:
+              description: Вне PvP режима (ограничения не действуют)
+              default: false
+          __PLUGIN_EOF__
+
+          cat > PvpMode/src/main/resources/config.yml <<'__CONFIG_EOF__'
+          # PvpMode. После урона от игрока (в обе стороны) включается PvP режим.
+          # Повторный удар заново ставит полный таймер.
+          duration-seconds: 15
+
+          # Вне PvP режима: оператор, право pvpmode.bypass, креатив и эти группы.
+          # Им показывается сообщение о PvP режиме, но ни на что оно не влияет.
+          exempt-creative: true
+          exempt-groups: [admin, ope, op]
+
+          # Команды, запрещённые в PvP режиме (имя команды или алиас, без слэша)
+          blocked-commands: [fly, timefly, tpa, tpc, tph, home, spawn, rtp, warp, mwtp]
+
+          # Команды запроса телепорта. Если игрок отправил такой запрос и потом вошёл в PvP,
+          # запрос отменяется: даже если его примут позже, телепорта не будет.
+          tp-request-commands: [tpa, tph]
+          tp-request-ttl-seconds: 120
+
+          # Какие телепорты блокируются в PvP режиме.
+          # PLUGIN: /home, /spawn, /rtp, порталы хаба, принятый /tpa.
+          # Админский /tp (COMMAND), жемчуг и обычные порталы не блокируются.
+          blocked-teleport-causes: [PLUGIN]
+          # Телепорты короче этого числа блоков не блокируются (отбрасывание от портала и т.п.)
+          min-teleport-distance: 8
+
+          messages:
+            start: "§cВы в PvP режиме на {sec} сек. Полёт и телепортация отключены. Не выходите из игры, иначе вещи выпадут."
+            start-exempt: "§eВы в PvP режиме (на вас это не влияет)."
+            end: "§aPvP режим закончился."
+            fly-off: "§eПолёт отключён из-за PvP режима."
+            fly-blocked: "§cВ PvP режиме полёт недоступен ещё {sec} сек."
+            cmd-blocked: "§cВ PvP режиме эта команда недоступна ещё {sec} сек."
+            tp-blocked: "§cВ PvP режиме телепортация недоступна ещё {sec} сек."
+            req-void: "§eЗапрос на телепорт отменён: вы вошли в PvP режим."
+            req-void-target: "§eЗапрос на телепорт от {player} отменён."
+            req-blocked: "§cТелепорт отменён: запрос был отменён из-за PvP режима."
+            bar: "§c§lPvP режим: §f{sec} сек"
+          __CONFIG_EOF__
+
+          cat > PvpMode/src/main/java/pvpmode/PvpMode.java <<'__JAVA_EOF__'
+          package pvpmode;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.player.PlayerCommandPreprocessEvent;
+          import cn.nukkit.event.player.PlayerDeathEvent;
+          import cn.nukkit.event.player.PlayerKickEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.event.player.PlayerTeleportEvent;
+          import cn.nukkit.event.player.PlayerToggleFlightEvent;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.Location;
+          import cn.nukkit.math.Vector3;
+          import cn.nukkit.plugin.Plugin;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+
+          import java.lang.reflect.Method;
+          import java.util.ArrayList;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          /**
+           * PvP режим: после урона от игрока (или удара по игроку) на N секунд включается режим.
+           * В нём нельзя летать, телепортироваться и пользоваться командами из blocked-commands.
+           * Выход из игры в режиме (в том числе обрыв интернета) - весь инвентарь выпадает.
+           * Кик, бан и остановка сервера - вещи остаются.
+           *
+           * Всё, в чём я не уверен по API ядра (боссбар, полёт, второй инвентарь), сделано через рефлексию:
+           * если метода нет, плагин не падает, а просто пропускает эту часть.
+           */
+          public class PvpMode extends PluginBase implements Listener {
+
+              private static final class Session {
+                  final Player player;
+                  long end;
+                  Object bar;
+                  long exemptAt;
+                  boolean exemptVal;
+
+                  Session(Player player) {
+                      this.player = player;
+                  }
+              }
+
+              private static final class TpReq {
+                  final Player from;
+                  final Player to;
+                  final long time;
+                  boolean voided;
+
+                  TpReq(Player from, Player to, long time) {
+                      this.from = from;
+                      this.to = to;
+                      this.time = time;
+                  }
+              }
+
+              private static final Object NO = new Object();
+
+              private final Map<UUID, Session> sessions = new ConcurrentHashMap<UUID, Session>();
+              private final Set<UUID> noDrop = ConcurrentHashMap.newKeySet();
+              private final Map<UUID, TpReq> requests = new ConcurrentHashMap<UUID, TpReq>();
+              private final Map<UUID, Long> lastWarn = new ConcurrentHashMap<UUID, Long>();
+
+              private volatile boolean stopping = false;
+
+              private int duration = 15;
+              private boolean exemptCreative = true;
+              private double minDist = 8;
+              private long reqTtlMs = 120000L;
+              private List<String> exemptGroups = new ArrayList<String>();
+              private Set<String> blockedCmds = new HashSet<String>();
+              private Set<String> reqCmds = new HashSet<String>();
+              private Set<String> blockedCauses = new HashSet<String>();
+
+              // ------------------------------------------------------------------ запуск
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  loadSettings();
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getServer().getScheduler().scheduleDelayedRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          try {
+                              tick();
+                          } catch (Throwable t) {
+                              getLogger().warning("[PvpMode] ошибка в тике: " + t);
+                          }
+                      }
+                  }, 5, 5);
+                  getLogger().info("PvpMode включен, длительность " + duration + " сек");
+              }
+
+              @Override
+              public void onDisable() {
+                  stopping = true;
+                  for (Session s : sessions.values()) {
+                      removeBar(s);
+                  }
+                  sessions.clear();
+                  noDrop.clear();
+                  requests.clear();
+              }
+
+              private void loadSettings() {
+                  duration = Math.max(1, getConfig().getInt("duration-seconds", 15));
+                  exemptCreative = getConfig().getBoolean("exempt-creative", true);
+                  minDist = Math.max(0, getConfig().getInt("min-teleport-distance", 8));
+                  reqTtlMs = Math.max(5, getConfig().getInt("tp-request-ttl-seconds", 120)) * 1000L;
+                  exemptGroups = readList("exempt-groups", "admin", "ope", "op");
+                  blockedCmds = new HashSet<String>(readList("blocked-commands",
+                          "fly", "timefly", "tpa", "tpc", "tph", "home", "spawn", "rtp", "warp", "mwtp"));
+                  reqCmds = new HashSet<String>(readList("tp-request-commands", "tpa", "tph"));
+                  blockedCauses = new HashSet<String>();
+                  for (String c : readList("blocked-teleport-causes", "PLUGIN")) {
+                      blockedCauses.add(c.toUpperCase(Locale.ROOT));
+                  }
+              }
+
+              private List<String> readList(String key, String... def) {
+                  List<String> out = new ArrayList<String>();
+                  Object o = null;
+                  try {
+                      o = getConfig().get(key);
+                  } catch (Throwable ignored) {
+                      // нет ключа
+                  }
+                  if (o instanceof List) {
+                      for (Object x : (List<?>) o) {
+                          if (x != null) {
+                              out.add(String.valueOf(x).trim().toLowerCase(Locale.ROOT));
+                          }
+                      }
+                      return out;
+                  }
+                  for (String s : def) {
+                      out.add(s.toLowerCase(Locale.ROOT));
+                  }
+                  return out;
+              }
+
+              private String msg(String key, String def) {
+                  try {
+                      return getConfig().getString("messages." + key, def);
+                  } catch (Throwable t) {
+                      return def;
+                  }
+              }
+
+              // ------------------------------------------------------------------ состояние
+
+              private boolean inPvp(Player p) {
+                  Session s = sessions.get(p.getUniqueId());
+                  return s != null && System.currentTimeMillis() < s.end;
+              }
+
+              private int secLeft(Player p, long now) {
+                  Session s = sessions.get(p.getUniqueId());
+                  if (s == null) {
+                      return 0;
+                  }
+                  return (int) Math.max(0, Math.ceil((s.end - now) / 1000.0));
+              }
+
+              /** Вне PvP режима: оператор, право pvpmode.bypass, креатив, группы из конфига. */
+              private boolean exempt(Player p) {
+                  try {
+                      if (p.isOp() || p.hasPermission("pvpmode.bypass")) {
+                          return true;
+                      }
+                      if (exemptCreative && p.isCreative()) {
+                          return true;
+                      }
+                      for (String g : exemptGroups) {
+                          if (inGroup(p, g)) {
+                              return true;
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                      // считаем, что не освобождён
+                  }
+                  return false;
+              }
+
+              private boolean exemptCached(Session s, long now) {
+                  if (now - s.exemptAt > 1000) {
+                      s.exemptVal = exempt(s.player);
+                      s.exemptAt = now;
+                  }
+                  return s.exemptVal;
+              }
+
+              /** Группа: право group.<имя> или основная группа в LuckPerms. */
+              private boolean inGroup(Player p, String g) {
+                  if (p.hasPermission("group." + g)) {
+                      return true;
+                  }
+                  try {
+                      Class<?> lpc = Class.forName("net.luckperms.api.LuckPerms");
+                      Object lp = Class.forName("net.luckperms.api.LuckPermsProvider").getMethod("get").invoke(null);
+                      Object um = lpc.getMethod("getUserManager").invoke(lp);
+                      Object user = Class.forName("net.luckperms.api.model.user.UserManager")
+                              .getMethod("getUser", UUID.class).invoke(um, p.getUniqueId());
+                      if (user == null) {
+                          return false;
+                      }
+                      Object primary = Class.forName("net.luckperms.api.model.user.User").getMethod("getPrimaryGroup").invoke(user);
+                      return primary != null && primary.toString().equalsIgnoreCase(g);
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              // ------------------------------------------------------------------ вход в PvP
+
+              private void tag(Player p) {
+                  long now = System.currentTimeMillis();
+                  UUID id = p.getUniqueId();
+                  Session s = sessions.get(id);
+                  boolean fresh = s == null;
+                  if (fresh) {
+                      s = new Session(p);
+                      sessions.put(id, s);
+                  }
+                  s.end = now + duration * 1000L;
+                  boolean ex = exempt(p);
+                  s.exemptVal = ex;
+                  s.exemptAt = now;
+                  if (fresh) {
+                      p.sendMessage(ex
+                              ? msg("start-exempt", "§eВы в PvP режиме (на вас это не влияет).")
+                              : msg("start", "§cВы в PvP режиме на {sec} сек. Полёт и телепортация отключены. Не выходите из игры, иначе вещи выпадут.")
+                              .replace("{sec}", String.valueOf(duration)));
+                      s.bar = createBar(p);
+                  }
+                  if (!ex) {
+                      voidRequests(p, now);
+                      if (stopFlight(p)) {
+                          p.sendMessage(msg("fly-off", "§eПолёт отключён из-за PvP режима."));
+                      }
+                  }
+                  showBar(s, now);
+              }
+
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+              public void onDamage(EntityDamageByEntityEvent e) {
+                  Entity victim = e.getEntity();
+                  Entity damager = e.getDamager();
+                  if (!(victim instanceof Player) || !(damager instanceof Player) || victim == damager) {
+                      return;
+                  }
+                  tag((Player) victim);
+                  tag((Player) damager);
+              }
+
+              // ------------------------------------------------------------------ таймер
+
+              private void tick() {
+                  long now = System.currentTimeMillis();
+                  for (Session s : sessions.values()) {
+                      Player p = s.player;
+                      if (!p.isOnline()) {
+                          sessions.remove(p.getUniqueId());
+                          removeBar(s);
+                          continue;
+                      }
+                      if (now >= s.end) {
+                          finish(s, true);
+                          continue;
+                      }
+                      if (!exemptCached(s, now)) {
+                          stopFlight(p);
+                      }
+                      showBar(s, now);
+                  }
+                  requests.values().removeIf(r -> now - r.time > reqTtlMs);
+              }
+
+              private void finish(Session s, boolean notify) {
+                  sessions.remove(s.player.getUniqueId());
+                  removeBar(s);
+                  if (notify && s.player.isOnline()) {
+                      s.player.sendMessage(msg("end", "§aPvP режим закончился."));
+                  }
+              }
+
+              // ------------------------------------------------------------------ красная полоса сверху
+
+              private String barText(int sec) {
+                  return msg("bar", "§c§lPvP режим: §f{sec} сек").replace("{sec}", String.valueOf(sec));
+              }
+
+              private Object createBar(Player p) {
+                  try {
+                      Class<?> bc = Class.forName("cn.nukkit.utils.DummyBossBar$Builder");
+                      Object b = bc.getConstructor(Player.class).newInstance(p);
+                      b = chain(b, "text", barText(duration));
+                      b = chain(b, "length", 100f);
+                      Object colored = invoke(b, "color", 255, 0, 0);
+                      if (colored != null) {
+                          b = colored;
+                      } else {
+                          try {
+                              Class<?> col = Class.forName("cn.nukkit.utils.BlockColor");
+                              Object c = col.getConstructor(int.class, int.class, int.class).newInstance(255, 0, 0);
+                              b = chain(b, "color", c);
+                          } catch (Throwable ignored) {
+                              // цвет по умолчанию
+                          }
+                      }
+                      Object bar = bc.getMethod("build").invoke(b);
+                      invoke(p, "createBossBar", bar);
+                      return bar;
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              private void showBar(Session s, long now) {
+                  long left = Math.max(0, s.end - now);
+                  float pct = Math.min(100f, left * 100f / (duration * 1000f));
+                  int sec = (int) Math.ceil(left / 1000.0);
+                  if (s.bar != null) {
+                      invoke(s.bar, "setLength", pct);
+                      invoke(s.bar, "setText", barText(sec));
+                      return;
+                  }
+                  // запасной вариант, если боссбар недоступен: красная линия над хотбаром
+                  int total = 24;
+                  int filled = Math.round(pct / 100f * total);
+                  StringBuilder sb = new StringBuilder("§c");
+                  for (int i = 0; i < filled; i++) {
+                      sb.append('|');
+                  }
+                  sb.append("§8");
+                  for (int i = filled; i < total; i++) {
+                      sb.append('|');
+                  }
+                  sb.append(" §f").append(sec).append(" сек");
+                  s.player.sendPopup(sb.toString());
+              }
+
+              private void removeBar(Session s) {
+                  if (s.bar == null) {
+                      return;
+                  }
+                  try {
+                      Object id = invoke(s.bar, "getBossBarId");
+                      if (id != null) {
+                          invoke(s.player, "removeBossBar", id);
+                      } else {
+                          invoke(s.bar, "destroy");
+                      }
+                  } catch (Throwable ignored) {
+                      // игрок уже вышел
+                  }
+                  s.bar = null;
+              }
+
+              // ------------------------------------------------------------------ полёт
+
+              /** Выключает полёт. true, если игрок мог летать или летел. */
+              private boolean stopFlight(Player p) {
+                  boolean had = false;
+                  try {
+                      Object as = invoke(p, "getAdventureSettings");
+                      if (as != null) {
+                          Class<?> tc = Class.forName("cn.nukkit.AdventureSettings$Type");
+                          Object fly = tc.getField("FLYING").get(null);
+                          Object allow = tc.getField("ALLOW_FLIGHT").get(null);
+                          Method get = as.getClass().getMethod("get", tc);
+                          Method set = as.getClass().getMethod("set", tc, boolean.class);
+                          had = Boolean.TRUE.equals(get.invoke(as, fly)) || Boolean.TRUE.equals(get.invoke(as, allow));
+                          if (had) {
+                              set.invoke(as, fly, false);
+                              set.invoke(as, allow, false);
+                              as.getClass().getMethod("update").invoke(as);
+                          }
+                      } else if (Boolean.TRUE.equals(invoke(p, "getAllowFlight"))) {
+                          had = true;
+                          invoke(p, "setAllowFlight", false);
+                      }
+                  } catch (Throwable ignored) {
+                      // API недоступно
+                  }
+                  if (had) {
+                      // чтобы античит не принял падение после отключения полёта за нарушение
+                      acExempt(p, "fly", 100);
+                      acExempt(p, "nofall", 100);
+                  }
+                  return had;
+              }
+
+              private void acExempt(Player p, String check, int ticks) {
+                  try {
+                      Plugin ac = getServer().getPluginManager().getPlugin("AntiCheat");
+                      if (ac == null) {
+                          return;
+                      }
+                      Class<?> api = Class.forName("anticheat.AntiCheatAPI", true, ac.getClass().getClassLoader());
+                      api.getMethod("exempt", Player.class, String.class, int.class).invoke(null, p, check, ticks);
+                  } catch (Throwable ignored) {
+                      // античита нет
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onToggleFlight(PlayerToggleFlightEvent e) {
+                  Player p = e.getPlayer();
+                  if (Boolean.TRUE.equals(invoke(e, "isFlying")) && inPvp(p) && !exempt(p)) {
+                      e.setCancelled(true);
+                      warn(p, msg("fly-blocked", "§cВ PvP режиме полёт недоступен ещё {sec} сек."));
+                  }
+              }
+
+              // ------------------------------------------------------------------ команды
+
+              private void warn(Player p, String text) {
+                  long now = System.currentTimeMillis();
+                  Long last = lastWarn.get(p.getUniqueId());
+                  if (last != null && now - last < 1000) {
+                      return;
+                  }
+                  lastWarn.put(p.getUniqueId(), now);
+                  p.sendMessage(text.replace("{sec}", String.valueOf(secLeft(p, now))));
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onCommand(PlayerCommandPreprocessEvent e) {
+                  Player p = e.getPlayer();
+                  String m = e.getMessage();
+                  if (m == null) {
+                      return;
+                  }
+                  m = m.trim();
+                  if (!m.startsWith("/")) {
+                      return;
+                  }
+                  String[] parts = m.substring(1).trim().split("\\s+");
+                  if (parts.length == 0 || parts[0].isEmpty()) {
+                      return;
+                  }
+                  String label = parts[0].toLowerCase(Locale.ROOT);
+                  int colon = label.indexOf(':');
+                  if (colon >= 0) {
+                      label = label.substring(colon + 1);
+                  }
+                  String real = label;
+                  try {
+                      Object cm = invoke(getServer(), "getCommandMap");
+                      Object cmd = invoke(cm, "getCommand", label);
+                      Object name = invoke(cmd, "getName");
+                      if (name != null) {
+                          real = String.valueOf(name).toLowerCase(Locale.ROOT);
+                      }
+                  } catch (Throwable ignored) {
+                      // остаёмся на введённом имени
+                  }
+                  if ((blockedCmds.contains(label) || blockedCmds.contains(real)) && inPvp(p) && !exempt(p)) {
+                      e.setCancelled(true);
+                      warn(p, msg("cmd-blocked", "§cВ PvP режиме эта команда недоступна ещё {sec} сек."));
+                      return;
+                  }
+                  if (parts.length >= 2 && (reqCmds.contains(label) || reqCmds.contains(real))) {
+                      Player t = getServer().getPlayer(parts[1]);
+                      if (t != null && t != p) {
+                          requests.put(p.getUniqueId(), new TpReq(p, t, System.currentTimeMillis()));
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ телепорты и запросы /tpa
+
+              /** Запрос на телепорт, отправленный до PvP, отменяется: примет его потом или нет, игрок не телепортируется. */
+              private void voidRequests(Player p, long now) {
+                  TpReq r = requests.get(p.getUniqueId());
+                  if (r == null || r.voided || now - r.time > reqTtlMs) {
+                      return;
+                  }
+                  r.voided = true;
+                  p.sendMessage(msg("req-void", "§eЗапрос на телепорт отменён: вы вошли в PvP режим."));
+                  if (r.to.isOnline()) {
+                      r.to.sendMessage(msg("req-void-target", "§eЗапрос на телепорт от {player} отменён.")
+                              .replace("{player}", p.getName()));
+                  }
+              }
+
+              private boolean far(Location a, Location b) {
+                  if (a.getLevel() != b.getLevel()) {
+                      return true;
+                  }
+                  return a.distanceSquared(b) > minDist * minDist;
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onTeleport(PlayerTeleportEvent e) {
+                  Player p = e.getPlayer();
+                  Location from = e.getFrom();
+                  Location to = e.getTo();
+                  if (from == null || to == null) {
+                      return;
+                  }
+                  if (!blockedCauses.contains(String.valueOf(e.getCause()).toUpperCase(Locale.ROOT))) {
+                      return;
+                  }
+                  if (!far(from, to)) {
+                      return;
+                  }
+                  long now = System.currentTimeMillis();
+                  if (inPvp(p) && !exempt(p)) {
+                      e.setCancelled(true);
+                      warn(p, msg("tp-blocked", "§cВ PvP режиме телепортация недоступна ещё {sec} сек."));
+                      return;
+                  }
+                  for (TpReq r : requests.values()) {
+                      if (!r.voided || now - r.time > reqTtlMs) {
+                          continue;
+                      }
+                      Player other;
+                      if (r.from == p) {
+                          other = r.to;
+                      } else if (r.to == p) {
+                          other = r.from;
+                      } else {
+                          continue;
+                      }
+                      if (!other.isOnline() || other.getLevel() != to.getLevel() || other.distanceSquared(to) > 36) {
+                          continue;
+                      }
+                      e.setCancelled(true);
+                      requests.remove(r.from.getUniqueId());
+                      p.sendMessage(msg("req-blocked", "§cТелепорт отменён: запрос был отменён из-за PvP режима."));
+                      return;
+                  }
+              }
+
+              // ------------------------------------------------------------------ смерть, кик, выход
+
+              @EventHandler(priority = EventPriority.MONITOR)
+              public void onDeath(PlayerDeathEvent e) {
+                  Entity en = e.getEntity();
+                  if (en instanceof Player) {
+                      Session s = sessions.get(((Player) en).getUniqueId());
+                      if (s != null) {
+                          finish(s, false);
+                      }
+                  }
+              }
+
+              /** Кик (античит, модератор, плагины наказаний, бан) - вещи не выпадают. Таймауты не считаются. */
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+              public void onKick(PlayerKickEvent e) {
+                  Player p = e.getPlayer();
+                  if (!sessions.containsKey(p.getUniqueId())) {
+                      return;
+                  }
+                  String reason = String.valueOf(invoke(e, "getReason")).toUpperCase(Locale.ROOT);
+                  if (reason.contains("TIMEOUT") || reason.contains("TIMED")) {
+                      return;
+                  }
+                  noDrop.add(p.getUniqueId());
+              }
+
+              @EventHandler(priority = EventPriority.HIGH)
+              public void onQuit(PlayerQuitEvent e) {
+                  Player p = e.getPlayer();
+                  UUID id = p.getUniqueId();
+                  boolean punished = noDrop.remove(id);
+                  requests.remove(id);
+                  lastWarn.remove(id);
+                  Session s = sessions.remove(id);
+                  if (s == null) {
+                      return;
+                  }
+                  removeBar(s);
+                  if (stopping || Boolean.FALSE.equals(invoke(getServer(), "isRunning"))) {
+                      return;
+                  }
+                  if (System.currentTimeMillis() >= s.end || s.exemptVal) {
+                      return;
+                  }
+                  if (punished || banned(p)) {
+                      getLogger().info("[PvpMode] " + p.getName() + " кикнут или забанен в PvP режиме, вещи остались");
+                      return;
+                  }
+                  int n = dropAll(p);
+                  getLogger().info("[PvpMode] " + p.getName() + " вышел в PvP режиме, выпало предметов: " + n);
+              }
+
+              private boolean banned(Player p) {
+                  try {
+                      Object nb = invoke(getServer(), "getNameBans");
+                      if (Boolean.TRUE.equals(invoke(nb, "isBanned", p.getName()))) {
+                          return true;
+                      }
+                      Object ib = invoke(getServer(), "getIPBans");
+                      Object ip = invoke(p, "getAddress");
+                      if (ip != null && Boolean.TRUE.equals(invoke(ib, "isBanned", String.valueOf(ip)))) {
+                          return true;
+                      }
+                  } catch (Throwable ignored) {
+                      // не удалось проверить
+                  }
+                  return false;
+              }
+
+              // ------------------------------------------------------------------ выпадение вещей
+
+              private void collect(List<Item> out, Object o) {
+                  if (!(o instanceof Item)) {
+                      return;
+                  }
+                  if (Boolean.TRUE.equals(invoke(o, "isNull"))) {
+                      return;
+                  }
+                  Object c = invoke(o, "clone");
+                  if (c instanceof Item) {
+                      out.add((Item) c);
+                  }
+              }
+
+              private void collectAll(List<Item> out, Object container) {
+                  if (container instanceof Map) {
+                      for (Object o : ((Map<?, ?>) container).values()) {
+                          collect(out, o);
+                      }
+                  } else if (container instanceof Object[]) {
+                      for (Object o : (Object[]) container) {
+                          collect(out, o);
+                      }
+                  }
+              }
+
+              /** Выбрасывает весь инвентарь на землю там, где стоял игрок. Возвращает число предметов. */
+              private int dropAll(Player p) {
+                  Level lv = p.getLevel();
+                  if (lv == null) {
+                      return 0;
+                  }
+                  List<Item> items = new ArrayList<Item>();
+                  try {
+                      var inv = p.getInventory();
+                      collectAll(items, invoke(inv, "getContents"));
+                      collectAll(items, invoke(inv, "getArmorContents"));
+                      Object off = invoke(p, "getOffhandInventory");
+                      if (off != null) {
+                          collect(items, invoke(off, "getItem", 0));
+                      }
+                      Object cur = invoke(p, "getCursorInventory");
+                      if (cur != null) {
+                          collect(items, invoke(cur, "getItem", 0));
+                      }
+
+                      // сначала чистим, потом бросаем: если очистка не удалась, дубликатов не будет
+                      inv.clearAll();
+                      int size = inv.getSize();
+                      for (int i = 0; i < 4; i++) {
+                          try {
+                              inv.clear(size + i);
+                          } catch (Throwable ignored) {
+                              // слота нет
+                          }
+                      }
+                      if (off != null) {
+                          invoke(off, "clearAll");
+                      }
+                      if (cur != null) {
+                          invoke(cur, "clearAll");
+                      }
+                  } catch (Throwable t) {
+                      getLogger().warning("[PvpMode] не удалось очистить инвентарь " + p.getName() + ": " + t);
+                      return 0;
+                  }
+                  Vector3 pos = new Vector3(p.x, p.y + 0.3, p.z);
+                  int n = 0;
+                  for (Item it : items) {
+                      try {
+                          lv.dropItem(pos, it);
+                          n++;
+                      } catch (Throwable t) {
+                          getLogger().warning("[PvpMode] не удалось выбросить предмет: " + t);
+                      }
+                  }
+                  return n;
+              }
+
+              // ------------------------------------------------------------------ рефлексия
+
+              private static Object chain(Object builder, String name, Object arg) {
+                  Object r = invoke(builder, name, arg);
+                  return r != null ? r : builder;
+              }
+
+              private static Class<?> wrap(Class<?> c) {
+                  if (!c.isPrimitive()) {
+                      return c;
+                  }
+                  if (c == int.class) {
+                      return Integer.class;
+                  }
+                  if (c == long.class) {
+                      return Long.class;
+                  }
+                  if (c == float.class) {
+                      return Float.class;
+                  }
+                  if (c == double.class) {
+                      return Double.class;
+                  }
+                  if (c == boolean.class) {
+                      return Boolean.class;
+                  }
+                  if (c == short.class) {
+                      return Short.class;
+                  }
+                  if (c == byte.class) {
+                      return Byte.class;
+                  }
+                  if (c == char.class) {
+                      return Character.class;
+                  }
+                  return c;
+              }
+
+              private static Object convert(Object a, Class<?> w) {
+                  if (w.isInstance(a)) {
+                      return a;
+                  }
+                  if (a instanceof Number) {
+                      Number n = (Number) a;
+                      if (w == Integer.class) {
+                          return n.intValue();
+                      }
+                      if (w == Long.class) {
+                          return n.longValue();
+                      }
+                      if (w == Float.class) {
+                          return n.floatValue();
+                      }
+                      if (w == Double.class) {
+                          return n.doubleValue();
+                      }
+                      if (w == Short.class) {
+                          return n.shortValue();
+                      }
+                      if (w == Byte.class) {
+                          return n.byteValue();
+                      }
+                  }
+                  return NO;
+              }
+
+              /** Вызывает публичный метод по имени. Возвращает результат или null, если метода нет, он void или упал. */
+              private static Object invoke(Object target, String name, Object... args) {
+                  if (target == null) {
+                      return null;
+                  }
+                  // сначала методы, где типы совпадают точно, потом с преобразованием чисел
+                  for (int pass = 0; pass < 2; pass++) {
+                      for (Method m : target.getClass().getMethods()) {
+                          if (!m.getName().equals(name) || m.getParameterCount() != args.length) {
+                              continue;
+                          }
+                          Class<?>[] pt = m.getParameterTypes();
+                          Object[] conv = new Object[args.length];
+                          boolean ok = true;
+                          for (int i = 0; i < pt.length; i++) {
+                              Class<?> w = wrap(pt[i]);
+                              if (pass == 0) {
+                                  if (!w.isInstance(args[i])) {
+                                      ok = false;
+                                      break;
+                                  }
+                                  conv[i] = args[i];
+                              } else {
+                                  Object c = convert(args[i], w);
+                                  if (c == NO) {
+                                      ok = false;
+                                      break;
+                                  }
+                                  conv[i] = c;
+                              }
+                          }
+                          if (!ok) {
+                              continue;
+                          }
+                          try {
+                              return m.invoke(target, conv);
+                          } catch (Throwable t) {
+                              return null;
+                          }
+                      }
+                  }
+                  return null;
+              }
+          }
+          __JAVA_EOF__
+
+      - name: Build
+        run: |
+          cd PvpMode
+          mvn -B clean package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: PvpMode-jar
+          path: PvpMode/target/PvpMode.jar
